@@ -99,7 +99,7 @@ densityBeanPlot.JH <- function (dat, sampGroups = NULL, sampNames = NULL, main =
 baseDir <- "~/orch_P/PIs/anne_goldfeld/TBHIV_850K"
 dataDir <- file.path(baseDir, "data")
 metaDir <- file.path(baseDir, "metadata")
-resultsDir <- file.path("./results")
+resultsDir <- file.path("./results",Sys.Date())
 dataDirectory_minfi<- system.file("extdata", package = "methylationArrayAnalysis")
 epic_probes_dir <- file.path(baseDir, "cross_reactive")
 dir.create(resultsDir)
@@ -329,7 +329,7 @@ We remove the samples based on the control SNPs.
 * 9H
 
 ```{r remove samples-not cluster}
-remove_samples <- c("1360E_W2","1360E_W34","9C","9H")
+remove_samples <- c("1360E_w2","1360E_W34","9C","9H")
 keep <- colnames(rgSet)[!colnames(rgSet) %in% remove_samples]
 rgSet <- rgSet[,keep]
 # remove poor quality samples from targets data
