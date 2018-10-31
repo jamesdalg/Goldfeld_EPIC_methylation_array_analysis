@@ -1,0 +1,671 @@
+---
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    highlight: zenburn
+    theme: flatly
+bibliography: bibliography.bib
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(tidy = TRUE, highlight = TRUE, dev = "png",
+               cache = TRUE, highlight = TRUE, autodep = TRUE, warning = FALSE, error = FALSE,
+               message = FALSE, prompt = TRUE, comment = '', fig.cap = '')
+```
+
+```{r}
+# load packages required for analysis
+library(minfi)
+library(RColorBrewer)
+library(missMethyl)
+library(matrixStats)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+library(knitr)
+library(ggplot2) # pretty plots
+library(wateRmelon) #pfilter and BMIQ funcitons
+library(rio)
+library(beanplot)
+library(CHBUtils)
+library(FlowSorted.Blood.450k)
+library(rdrop2)
+```
+
+```{r}
+annEPIC = getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+```
+
+
+# Overview
+
+- Primary Investigator: Anne Goldfeld
+- Researcher: Viraga Haridas
+- Experiment: Epic Methylation Array
+- Analist: Victor Barrera (HSPH Bioinformatics core)
+
+47 samples have been analyzed using the Illumina EPIC methylation array. In this report, we include the quality analysis and the first filtering steps. We have the following groups:
+
+* 4 TB-HIV-
+* 7 TB-HIV+
+* 4 TB+HIV-
+* 32 TB+HIV+
+
+
+The most recent update of this html document occurred: `r date()`.
+
+The sections below provide code to reproduce the included results and plots.
+
+```{r functions}
+densityBeanPlot.JH <- function (dat, sampGroups = NULL, sampNames = NULL, main = NULL, pal = branrewer.pal(12, "Set3"), numPositions = 10000, label.size=0.8) 
+{
+    if (is(dat, "RGChannelSet") || is(dat, "MethylSet")) {
+        b <- getBeta(dat)
+    }
+    else if (is(dat, "matrix")) {
+        b <- dat
+    }
+    else {
+        stop("argument 'dat' must be an 'RGChannelSet', a 'MethylSet'  or matrix.")
+    }
+    n <- ncol(b)
+    if (!is.null(sampNames)) 
+        colnames(b) <- sampNames
+    if (is.null(main)) 
+        main <- "Beta"
+    if (is.null(sampGroups)) 
+        sampGroups <- rep(1, n)
+    sampGroups <- as.factor(sampGroups)
+    col <- lapply(sampGroups, function(x) rep(pal[x], 4))
+    if (is.null(numPositions)) 
+        idx <- 1:dim(dat)[1]
+    else idx <- sample(nrow(b), numPositions)
+    x <- melt(b[idx, ], varnames = c("cpg", "sample"))
+    o <- order(colnames(b))
+    beanplot(value ~ sample, horizontal = TRUE, what = c(0, 1, 
+        1, 0), log = "", las = 1, ylim = c(0, 1), xlab = "Beta", 
+        main = main, col = col[o], data = x, cex.axis=label.size, cex.lab = 0.9, beanlinewd = 1, 
+        border = NA)
+    abline(h = 1:(n + 1) - 0.5, lty = 3, col = "grey70")
+}
+```
+
+```{r, set general variables}
+baseDir <- "~/orch_P/PIs/anne_goldfeld/TBHIV_850K"
+dataDir <- file.path(baseDir, "data")
+metaDir <- file.path(baseDir, "metadata")
+resultsDir <- file.path("./results")
+dataDirectory_minfi<- system.file("extdata", package = "methylationArrayAnalysis")
+epic_probes_dir <- file.path(baseDir, "cross_reactive")
+dir.create(resultsDir)
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+
+```{r metadataimport, message = FALSE}
+metadata <- rio::import(file.path(metaDir, "metadata_final.csv" ))
+
+# read in the sample sheet for the experiment
+targets <- read.metharray.sheet(dataDir, pattern="metadata_final.csv")
+
+barcodes <- unique(sub("_Grn.idat|_Red.idat", "", list.files(path = dataDir, pattern = "idat$",recursive = TRUE)))
+```
+
+```{r load data, message = FALSE}
+# read in the raw data from the IDAT files
+if (file.exists("./rda_objects/rgSet.rda" )){
+      load(file.path("./rda_objects/rgSet.rda"))
+} else {
+    rgSet <- read.metharray.exp(targets = targets,force = TRUE)
+    save(rgSet, file = file.path("./rda_objects/rgSet.rda"))
+}
+
+if (file.exists("./rda_objects/mldat.rda" )){
+      load(file.path("./rda_objects/mldat.rda"))
+} else {
+    mldat <- readEPIC(barcodes = barcodes, idatPath = dataDir, oob = TRUE, force = TRUE)
+    save(mldat, file=file.path("./rda_objects/mldat.rda"))
+}
+```
+
+```{r rename samples}
+# give the samples descriptive names
+targets$ID <- paste(targets$sample_name)
+sampleNames(rgSet) <- targets$ID
+
+tempMeta <- metadata %>% dplyr::select(sample_name, Basename) %>%
+    tidyr::separate(Basename, c("dataDir","barcode"), sep = "/data/")
+tempMeta <- tempMeta[match(sampleNames(mldat), tempMeta$barcode),]
+sampleNames(mldat) <- tempMeta$sample_name
+```
+
+```{r detectionPvalues}
+# calculate the detection p-values
+detP <- detectionP(rgSet)
+```
+
+# Quality Control
+
+## Mean P-values detection
+
+We generate a detection p-value for every CpG in every sample, which is indicative of the quality of the signal. Very small p-values are indicative of a reliable signal whilst large p-values, for example >0.01, generally indicate a poor quality signal.
+Plotting the mean detection p-value for each sample allows us to gauge the general quality of the samples in terms of the overall signal reliability. Samples that have many failed probes will have relatively large mean detection p-values.
+
+Mean detection p-values summarise the quality of the signal across all the probes in each sample. 
+
+All the samples show good detection p-values.
+
+```{r plot detectionPvalues}
+# examine mean detection p-values across all samples to identify any failed samples
+pal <- brewer.pal(8,"Dark2")
+barplot(colMeans(detP), col=pal[factor(targets$sample_group)], las=2, 
+        cex.names=0.8, ylim=c(0,0.002), ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(targets$sample_group)), fill=pal, 
+       bg="white")
+```
+
+## Probeset controls {.tabset}
+
+All the array controls show no problems with the different samples. 
+
+```{r controlprobeset_minfi, results = 'asis', fig.height=10, fig.width=10}
+# these use the minfi RGChannelSet objects
+control.probesets <- c("BISULFITE CONVERSION I", "BISULFITE CONVERSION II", "EXTENSION", "HYBRIDIZATION", "NEGATIVE", "NON-POLYMORPHIC", "NORM_A", "NORM_C", "NORM_G", "NORM_T", "SPECIFICITY I", "SPECIFICITY II")
+for (set in control.probesets) {
+    cat("\n###",set,"\n")
+    p <- controlStripPlot(rgSet, controls = set, sampNames = pData(rgSet)$sample_name,xlim = c(0,17))
+    print(p)
+    cat("\n")
+}
+```
+
+## Intensity Distributions {.tabset}
+
+We can also take a look at their overall beta values to see if we find any outliers. None is identified.
+
+### By Sample
+```{r densityplots_minfi_sample}
+# these use the minfi RGChannelSet object
+densityPlot(rgSet, sampGroups = pData(rgSet)$sample_name, main = "By Sample", legend = FALSE)
+### density bean plots
+densityBeanPlot.JH(rgSet, sampGroups=pData(rgSet)$Array, sampNames = pData(rgSet)$sample_name, main="By Array", pal=cbPalette,label.size = 0.3)
+```
+
+### By Array
+```{r densityplots_minfi_array}
+# these use the minfi RGChannelSet object
+densityPlot(rgSet, sampGroups = pData(rgSet)$Array, main = "By Array", pal = cbPalette, legend = FALSE)
+### density bean plots
+densityBeanPlot.JH(rgSet, sampGroups=pData(rgSet)$Array, sampNames = pData(rgSet)$sample_name, main="By Array", pal=cbPalette,label.size = 0.3)
+```
+
+### By Slide
+
+```{r densityplots_minfi_slide}
+densityPlot(rgSet, sampGroups = pData(rgSet)$Slide, main = "By Slide", pal = cbPalette, legend = FALSE)
+densityBeanPlot.JH(rgSet, sampGroups = pData(rgSet)$Slide, sampNames = pData(rgSet)$sample_name, main = "By Slide", pal=cbPalette, label.size = 0.3)
+```
+
+## Sample Genotype {.tabset}
+
+We use control SNPs to check the correspondence between samples. This is specially important given the time series analysis. 
+
+### All samples
+
+```{r snps_methylumi}
+# this is the only reason you are keeping methylumi around
+betas.snps <- betas(mldat)[grep("rs", row.names(betas(mldat))),]
+names(betas.snps) <- names(betas.snps) 
+
+cor.snps <- cor(betas.snps, use = "pairwise.complete.obs")
+cor.snps <- cor.snps[order(rownames(cor.snps)),order(colnames(cor.snps))]
+
+cor.snps.m <- melt(cor.snps)
+ggplot(cor.snps.m, aes(Var1, Var2, fill = value>0.95)) + geom_tile(color="darkgrey")+
+    scale_x_discrete(name="")+scale_y_discrete(name="")+
+    theme(axis.text.x = element_text(angle = 90, hjust =  1, vjust = 0.5))+
+    scale_fill_manual(values = cbPalette[1:2])
+
+# what are the sample pairs with high SNP concordance
+cor.snps.hi <- cor.snps.m[cor.snps.m$value > 0.6,]
+
+cor.snps.hi <- cor.snps.hi[apply(cor.snps.hi, 1, function(x){
+  x[1] != x[2]
+}),]
+
+names(cor.snps.hi) <- c("Sample1", "Sample2", "correlation")
+```
+
+### Only time-series
+
+We can observe that the samples 1360E_W2 and 1360E_W34 do not have enough correlation between the control SNPs. This pair should have a higher value (expected around 1). This can indicate a sample contamination or swap. We discard these samples.
+
+```{r snps_w2_w34}
+# this is the only reason you are keeping methylumi around
+betas.snps <- betas(mldat)[grep("rs", row.names(betas(mldat))),]
+names(betas.snps) <- names(betas.snps) 
+betas.snps_w2_w34 <- betas.snps[,grepl("W", colnames(betas.snps))]
+
+cor.snps_w2_w34 <- cor(betas.snps_w2_w34, use = "pairwise.complete.obs")
+
+cor.snps_w2_w34 <- cor.snps_w2_w34[order(rownames(cor.snps_w2_w34)),order(colnames(cor.snps_w2_w34))]
+
+cor.snps_w2_w34.m <- melt(cor.snps_w2_w34)
+ggplot(cor.snps_w2_w34.m, aes(Var1, Var2, fill = value>0.95)) + geom_tile(color="darkgrey")+
+    scale_x_discrete(name="")+scale_y_discrete(name="")+
+    theme(axis.text.x = element_text(angle = 90, hjust =  1, vjust = 0.5))+
+    scale_fill_manual(values = cbPalette[1:2])
+
+# what are the sample pairs with high SNP concordance
+cor.snps_w2_w34.hi <- cor.snps_w2_w34.m[cor.snps_w2_w34.m$value > 0.6,]
+
+cor.snps_w2_w34.hi <- cor.snps_w2_w34.hi[apply(cor.snps_w2_w34.hi, 1, function(x){
+  x[1] != x[2]
+}),]
+
+names(cor.snps_w2_w34.hi) <- c("Sample1", "Sample2", "correlation")
+```
+
+### No time series
+
+We observe a very high correlation between samples 9C and 9H. These samples correspond to completely different patients. This correlation value so high can indicate problems with samples (swap, duplication, etc). We discard them for further analysis.
+
+```{r snps_other}
+# this is the only reason you are keeping methylumi around
+betas.snps <- betas(mldat)[grep("rs", row.names(betas(mldat))),]
+names(betas.snps) <- names(betas.snps) 
+betas.snps_other <- betas.snps[,!grepl("W", colnames(betas.snps))]
+
+cor.snps_other <- cor(betas.snps_other, use = "pairwise.complete.obs")
+
+cor.snps_other <- cor.snps_other[order(rownames(cor.snps_other)),order(colnames(cor.snps_other))]
+
+cor.snps_other.m <- melt(cor.snps_other)
+ggplot(cor.snps_other.m, aes(Var1, Var2, fill = value>0.95)) + geom_tile(color="darkgrey")+
+    scale_x_discrete(name="")+scale_y_discrete(name="")+
+    theme(axis.text.x = element_text(angle = 90, hjust =  1, vjust = 0.5))+
+    scale_fill_manual(values = cbPalette[1:2])
+
+# what are the sample pairs with high SNP concordance
+cor.snps_other.hi <- cor.snps_other.m[cor.snps_w2_w34.m$value > 0.6,]
+
+cor.snps_other.hi <- cor.snps_other.hi[apply(cor.snps_other.hi, 1, function(x){
+  x[1] != x[2]
+}),]
+
+names(cor.snps_other.hi) <- c("Sample1", "Sample2", "correlation")
+```
+
+## Correlation table
+
+```{r showcorrs, results='asis'}
+kable(cor.snps.hi, row.names=FALSE)
+```
+
+
+## Remove samples
+
+We remove samples with high detection p-values (greater than 0.05). No samples are remove due to this filter.
+
+```{r drop samples}
+# remove poor quality samples
+keep <- colMeans(detP) < 0.05
+rgSet <- rgSet[,keep]
+# remove poor quality samples from targets data
+targets <- targets[keep,]
+```
+
+We remove the samples based on the control SNPs.
+
+* 1360E_W2 
+* 1360E_W34 
+* 9C
+* 9H
+
+```{r remove samples-not cluster}
+remove_samples <- c("1360E_W2","1360E_W34","9C","9H")
+keep <- colnames(rgSet)[!colnames(rgSet) %in% remove_samples]
+rgSet <- rgSet[,keep]
+# remove poor quality samples from targets data
+targets <- targets %>%
+    dplyr::filter(sample_name %in% keep)
+
+# recalculate detection peak
+detP <- detectionP(rgSet)
+```
+
+
+
+# Normalisation
+
+The samples can have different signal not due to biological differences but for technical reasons (i.e: different initial sample amount or increased overall signal within an specific array). To minimise the unwanted variation within and between samples, a normalisation process is applied. Various data normalisations can be applied. Several methods have been built into minfi and can be directly applied within its framework [@minfi2014]. Although there is no single normalisation method that is universally considered best, a recent study by [@Fortin2014] has suggested that the preprocessQuantile function,based on [@Touleimat2012], is more suited for datasets where you do not expect global differences between your samples, for example a single tissue, in this case blood. This function implements a stratified quantile normalisation procedure which is applied to the methylated and unmethylated signal intensities separately, and takes into account the different probe types. 
+
+```{r, normalize, message= FALSE}
+# normalize the data; this results in a GenomicRatioSet object
+mSetSq <- preprocessQuantile(rgSet) 
+
+# create a MethylSet object from the raw data for plotting
+mSetRaw <- preprocessRaw(rgSet)
+
+# visualise what the data looks like before and after normalisation
+par(mfrow=c(1,2))
+densityPlot(mSetRaw, sampGroups=targets$sample_group,main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(targets$sample_group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(getBeta(mSetSq), sampGroups=targets$sample_group,
+            main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(targets$sample_group)), 
+       text.col=brewer.pal(8,"Dark2"))
+
+```
+
+
+
+## Methylation Based Clustering {.tabset}
+
+First lets look at an unsupervised clustering of the samples to check if they cluster by class.
+
+We can observe that the samples distribute based mainly based on gender.
+
+### TB/HIV 
+
+```{r mdsplot_group}
+mdsplot.RGset(mSetSq, numPositions = 10000, sampGroups = "sample_group", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Array
+
+```{r mdsplot_array}
+mdsplot.RGset(mSetSq, numPositions = 10000, sampGroups = "Array", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Slide
+
+```{r mdsplot_slide}
+mdsplot.RGset(mSetSq, numPositions = 10000, sampGroups = "Slide", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Gender
+
+```{r mdsplot_gender}
+mdsplot.RGset(mSetSq, numPositions = 10000, sampGroups = "gender", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Age
+
+```{r mdsplot_age}
+mdsplot.RGset(mSetSq, numPositions = 10000, sampGroups = "age", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+## Separation based on gender {.tabset}
+
+No cluster is observed. 
+
+### Male
+```{r genderedmds_male}
+mdsplot.RGset(mSetSq[,which(pData(rgSet)$gender=="M")], numPositions = 10000, sampGroups = "sample_group", main="Beta-value MDS, 10000 most variable positions, by Group, Male only", cex=3, alpha=0.5)
+```
+
+### Female
+
+```{r genderedmds_female}
+mdsplot.RGset(mSetSq[,which(pData(rgSet)$gender=="F")], numPositions = 10000, sampGroups = "sample_group", main="Beta-value MDS, 10000 most variable positions, by Group, Female only", cex=3, alpha=0.5)
+```
+
+# Probe Filtering
+
+Poor performing probes are generally filtered out prior to differential methylation analysis. As the signal from these probes is unreliable, by removing them we perform fewer statistical tests and thus incur a reduced multiple testing penalty. 
+
+## Remove probes with high detection p-values (greater than 0.01) in all samples.
+
+As describe before, high detection p-values indicate a poor quality signal. For that reason, we filter out probes that have failed in one or more samples based on detection p-value.
+```{r probe filtering based on detection peak}
+# ensure probes are in the same order in the mSetSq and detP objects
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),] 
+
+# remove any probes that have failed in one or more samples
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+
+mSetSqFlt <- mSetSq[keep,]
+#mSetSqFlt
+
+```
+
+`r table(keep)[2]` probes pass this filter.
+
+## Remove probes that correspond to the X and Y chromosomes.
+
+As the samples include both, males and females, we need to remove the probes located in the sexual chromosomes as the information will not be consistent among them.
+
+```{r probe filtering sex chromosomes}
+# if your data includes males and females, remove probes on the sex chromosomes
+keep <- !(featureNames(mSetSqFlt) %in% annEPIC$Name[annEPIC$chr %in% 
+                                                        c("chrX","chrY")])
+mSetSqFlt <- mSetSqFlt[keep,]
+```
+
+`r table(keep)[2]` probes pass this filter.
+
+
+## Remove probes that have SNPs
+
+Single nucleotide polymorphisms represent small genetic variations in individuals. We have to eliminate these probes as any difference in methylation status found associated with these positions can be cause by the genetic variation and not by changes in the methylation patterns.
+
+```{r probe filtering snps}
+# remove probes with SNPs at CpG site
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+#mSetSqFlt
+```
+
+`r nrow(mSetSqFlt)` probes pass this filter.
+
+## Remove cross reactive probes and variants
+
+We will also filter out probes that have shown to be cross-reactive, that is, probes that have been demonstrated to map to multiple places in the genome. This list was originally published by Chen et al. (2013) [@Chen2013] and extended by Pidsley et al. (2016) for the EPIC array [Pidsley2016]. Also, we eliminate those probes overlapping genetic variants because any difference found in these probes cannot be linked to changes in methylation status or genetic variability.
+
+```{r probe filtering cross reactive}
+# exclude cross reactive probes 
+xReactiveProbes <- read.csv(file="/Users/victorbarrera/R/library/methylationArrayAnalysis/extdata/48639-non-specific-probes-Illumina450k.csv", stringsAsFactors=FALSE)
+keep <- !(featureNames(mSetSqFlt) %in% xReactiveProbes$TargetID)
+
+mSetSqFlt <- mSetSqFlt[keep,]
+```
+
+```{r probe filtering EPIC xcross and variants}
+# probes from Pidsley 2016 (EPIC)
+
+if (file.exists("./rda_objects/probes_filter_epic.rda" )){
+      load(file.path("./rda_objects/probes_filter_epic.rda"))
+} else {
+epic.cross1 <- read.csv(file = paste0(epic_probes_dir,'/13059_2016_1066_MOESM1_ESM.csv'), head = T)
+epic.variants1 <- read.csv(file = paste0(epic_probes_dir,'/13059_2016_1066_MOESM4_ESM.csv'), head = T)
+epic.variants2 <- read.csv(file = paste0(epic_probes_dir,'/13059_2016_1066_MOESM5_ESM.csv'), head = T)
+epic.variants3 <- read.csv(file = paste0(epic_probes_dir,'/13059_2016_1066_MOESM6_ESM.csv'), head = T)
+# additional filter probes
+epic.add.probes <- c(as.character(epic.cross1$X), as.character(epic.variants1$PROBE), as.character(epic.variants2$PROBE), 
+                     as.character(epic.variants3$PROBE))
+# final list of unique probes
+epic.add.probes <- unique(epic.add.probes)
+    save(epic.add.probes, file = file.path("./rda_objects/probes_filter_epic.rda"))
+    }
+keep <- !(featureNames(mSetSqFlt) %in% epic.add.probes)
+
+mSetSqFlt <- mSetSqFlt[keep,]
+```
+
+
+We keep a total of `r table(keep)[2]` probes after all filtering.
+
+
+# After filtering QC
+
+We analyze the samples distribution after filtering.
+
+## Methylation Based Clustering {.tabset}
+
+Samples don't cluster anymore by gender, although male samples tend to stay closer.
+
+### TB/HIV 
+
+```{r mdsplot_group_flt}
+mdsplot.RGset(mSetSqFlt, numPositions = 10000, sampGroups = "sample_group", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Array
+
+```{r mdsplot_array_flt}
+mdsplot.RGset(mSetSqFlt, numPositions = 10000, sampGroups = "Array", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Slide
+
+```{r mdsplot_slide_flt}
+mdsplot.RGset(mSetSqFlt, numPositions = 10000, sampGroups = "Slide", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Gender
+
+```{r mdsplot_gender_flt}
+mdsplot.RGset(mSetSqFlt, numPositions = 10000, sampGroups = "gender", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+### Age
+
+```{r mdsplot_age_flt}
+mdsplot.RGset(mSetSqFlt, numPositions = 10000, sampGroups = "age", main="Beta-value MDS, 10000 most variable positions, by Group", cex = 3, alpha=0.5)
+```
+
+## Separation based on gender {.tabset}
+
+We don't observe specific clusters although in the female group we can see a separation among the y axis in the different groups.
+
+### Male
+```{r genderedmds_male_flt}
+mdsplot.RGset(mSetSqFlt[,which(pData(rgSet)$gender=="M")], numPositions = 10000, sampGroups = "sample_group", main="Beta-value MDS, 10000 most variable positions, by Group, Male only", cex=3, alpha=0.5)
+```
+
+### Female
+
+```{r genderedmds_female_flt}
+mdsplot.RGset(mSetSqFlt[,which(pData(rgSet)$gender=="F")], numPositions = 10000, sampGroups = "sample_group", main="Beta-value MDS, 10000 most variable positions, by Group, Female only", cex=3, alpha=0.5)
+```
+
+
+
+# Cell Composition {.tabset}
+
+We obtain the different cell composition for the different samples using "Blood" as reference.
+
+We can see that the different groups present different cell compositions. Methylation can be heavily affected by cell composition [@Jaffe2014].
+
+The following plot is used to check for large batch effects in the data. This plot depicts the average DNA methylation across the cell-type discrimating probes in both the provided and sorted data. The means from the provided heterogeneous samples should be within the range of the sorted samples. If the sample means fall outside the range of the sorted means, the cell type estimates will be inflated to the closest cell type.
+
+We observe that our samples (in black) fall within the range of the sorted reference samples (in colours). This means that the obtained estimations can be used for correction during the differential methylation analysis. 
+
+```{r cell composition}
+library(FlowSorted.Blood.450k)
+rgSet_cell <- convertArray(rgSet,
+                  outType = c("IlluminaHumanMethylationEPIC"),
+                  verbose = TRUE)
+
+pData(rgSet_cell)$Slide <- as.numeric(pData(rgSet_cell)$Slide)
+cellCounts <- estimateCellCounts(rgSet_cell,compositeCellType = "Blood", meanPlot = T)
+
+cellComposition_100 <- cellCounts * 100 
+cellComposition_100 <- round(cellCounts,2)
+```
+
+## By group
+```{r cell_composition_boxplot, fig.width= 15}
+cell_counts_df <- cellCounts %>% as.data.frame() %>% 
+    tibble::rownames_to_column(var = "ID") %>% dplyr::inner_join(targets) %>%
+    dplyr::select(c("ID","CD8T","CD4T","NK","Bcell","Mono","Gran","sample_group"))
+
+cell_counts_melt <- melt(cell_counts_df)
+colnames(cell_counts_melt)[3] <- "cell_type"
+
+ggplot(cell_counts_melt,aes(x = cell_type,y = value, fill = cell_type)) +
+    geom_boxplot() + facet_grid(.~sample_group)
+```
+
+## By Cell type
+```{r, fig.width= 15}
+ggplot(cell_counts_melt,aes(x= sample_group,y = value, fill = sample_group)) +
+    geom_boxplot() + facet_grid(.~cell_type)
+```
+
+# Values
+
+```{r showCellComposion, results='asis'}
+kable(cellComposition_100)
+```
+
+# M and Beta values distribution
+
+We explore the M and Beta values distributions. No outliers are detected.
+
+```{r obtain M and B values}
+# calculate M-values for statistical analysis
+mVals <- getM(mSetSqFlt)
+
+bVals <- getBeta(mSetSqFlt)
+
+par(mfrow=c(1,2))
+densityPlot(bVals, sampGroups=targets$sample_group, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+legend("top", legend = levels(factor(targets$sample_group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(mVals, sampGroups=targets$sample_group, main="M-values", 
+            legend=FALSE, xlab="M values")
+legend("topleft", legend = levels(factor(targets$sample_group)), 
+       text.col=brewer.pal(8,"Dark2"))
+
+```
+
+# Results Files
+
+```{r write_files}
+cellCounts <- cellCounts %>% as.data.frame() %>% tibble::rownames_to_column(var = "sample")
+mVals <- mVals %>% as.data.frame() %>% tibble::rownames_to_column(var = "probe")
+bVals <- bVals %>% as.data.frame() %>% tibble::rownames_to_column(var = "probe")
+
+rio::export(cellCounts, file = paste0(resultsDir,"/cellComposition.csv"))
+rio::export(mVals, file = paste0(resultsDir,"/m_values.csv"))
+rio::export(bVals, file = paste0(resultsDir,"/b_values.csv"))
+```
+
+<p><a href="results/cellComposition.csv">cell composition</a></p>
+<p><a href="results/m_values.csv">M values</a></p>
+<p><a href="results/b_values.csv">Beta values</a></p>
+
+# Conclusions
+
+We have analyzed the quality of 47 samples. After the initial QC, 4 samples were discarded for lack of correlation with its pairs or for having high correlation with unrelated samples. The multidimensional scaling analysis of methylation values shows a high gender effect that separates the samples.
+
+Probes with high detection p-values, gender related, SNPs or cross reactive have been removed. As a result, the gender effect has been reduced. 
+
+Cell composition analysis of the samples, using blood as reference, has been performed. We observe differences in the composition of cell types in the different samples. This should be taken into account for downstream analysis.
+
+A cell composition estimation and Beta and M values files are provided.
+
+# Suggested next steps
+
+The quality of the samples looks good in terms of signal. However, some gender and cell compositions effects are observed. For the differential methylation analysis it is recommended to include this elements as factors for the model. 
+
+The cell proportions can be used together with the beta values as adjusting co-variate in the linear model. In the following [link](https://akhilesh362.wordpress.com) a guided tutorial. The sections of Houseman et al. and especially, extended Houseman et al., can be used with the obtained files in this report.
+
+# R session
+
+This was the R version and packages version used for this analysis. The main analysis have been performed using the minfi package [@minfi2017].
+
+```{r session}
+devtools::session_info()
+```
+
+# Bibliography

@@ -1,0 +1,259 @@
+---
+title: "Untitled"
+author: "Victor Barrera"
+date: "October 6, 2017"
+output: html_document
+---
+
+```{r}
+# load packages required for analysis
+library(limma)
+library(minfi)
+library(RColorBrewer)
+library(missMethyl)
+library(matrixStats)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+library(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+library(IlluminaHumanMethylationEPICmanifest)
+```
+
+```{r}
+# set up a path to the data directory
+dataDirectory <- "~/orch_P/PIs/anne_goldfeld/TBHIV_850K/data"
+
+```
+
+```{r}
+# read in the sample sheet for the experiment
+targets <- read.metharray.sheet(dataDirectory, pattern="metadata_final.csv")
+```
+
+```{r}
+# read in the raw data from the IDAT files
+rgSet <- read.metharray.exp(targets=targets,force = TRUE)
+```
+
+```{r}
+# give the samples descriptive names
+targets$ID <- paste(targets$sample_name)
+sampleNames(rgSet) <- targets$ID
+```
+
+```{r}
+# calculate the detection p-values
+detP <- detectionP(rgSet)
+```
+
+```{r}
+# examine mean detection p-values across all samples to identify any failed samples
+pal <- brewer.pal(8,"Dark2")
+par(mfrow=c(1,2))
+barplot(colMeans(detP), col=pal[factor(targets$sample_group)], las=2, 
+        cex.names=0.8, ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(targets$sample_group)), fill=pal,
+       bg="white")
+
+barplot(colMeans(detP), col=pal[factor(targets$sample_group)], las=2, 
+        cex.names=0.8, ylim=c(0,0.002), ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(targets$sample_group)), fill=pal, 
+       bg="white")
+```
+
+```{r}
+
+qcReport(rgSet, sampNames=targets$ID, sampGroups=targets$sample_group, 
+         pdf="qcReport.pdf")
+```
+
+```{r}
+# remove poor quality samples
+keep <- colMeans(detP) < 0.05
+rgSet <- rgSet[,keep]
+rgSet
+
+
+# remove poor quality samples from targets data
+targets <- targets[keep,]
+targets[,1:5]
+```
+
+
+```{r}
+# normalize the data; this results in a GenomicRatioSet object
+mSetSq <- preprocessQuantile(rgSet) 
+
+## [preprocessQuantile] Mapping to genome.
+
+## [preprocessQuantile] Fixing outliers.
+
+## Warning in .getSex(CN = CN, xIndex = xIndex, yIndex = yIndex, cutoff = cutoff):
+## An inconsistency was encountered while determining sex. One possibility is
+## that only one sex is present. We recommend further checks, for example with the
+## plotSex function.
+
+## [preprocessQuantile] Quantile normalizing.
+
+# create a MethylSet object from the raw data for plotting
+mSetRaw <- preprocessRaw(rgSet)
+
+# visualise what the data looks like before and after normalisation
+par(mfrow=c(1,2))
+densityPlot(rgSet, sampGroups=targets$sample_group,main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(targets$sample_group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(getBeta(mSetSq), sampGroups=targets$sample_group,
+            main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(targets$sample_group)), 
+       text.col=brewer.pal(8,"Dark2"))
+
+```
+
+```{r}
+
+# MDS plots to look at largest sources of variation
+par(mfrow=c(1,2))
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$sample_group)])
+legend("top", legend=levels(factor(targets$sample_group)), text.col=pal,
+       bg="white", cex=0.7)
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common",  
+        col=pal[factor(targets$Time)])
+legend("top", legend=levels(factor(targets$Time)), text.col=pal,
+       bg="white", cex=0.7)
+
+```
+
+
+```{r}
+snpI_probes<-getProbeInfo(IlluminaHumanMethylationEPICmanifest, type = "SnpI")
+snpII_probes<-getProbeInfo(IlluminaHumanMethylationEPICmanifest, type = "SnpII")
+
+snpI_names <- snpI_probes$Name
+snpII_names <- snpII_probes$Name
+
+class(SNPs.Illumina)
+
+validSNPs <- SNPs.Illumina[SNPs.Illumina$SNP_ID != "",]
+    
+validSNPs %>% as.data.frame() %>% tibble::rownames_to_column(var = "cgID") %>%
+    dplyr::select(c(cgID,SNP_ID)) %>% dplyr::mutate(SNP_ID = strsplit(as.character(SNP_ID), ";")) %>% 
+    tidyr::unnest(SNP_ID) %>%
+    dplyr::filter(SNP_ID %in% c(snpI_names,snpII_names))
+
+
+
+
+
+
+rs10796216,rs10796216,0084632581,TAACTAAAAAACAACAATACTAACTCTACACTAAATACCCACTAACCCTT,0077745366,TAACTAAAAAACAACAATACTAACTCTACACTAAATACCCACTAACCCTC,I,A,Red,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,TRUE,,,,,,
+
+
+data(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+
+
+
+X <- getSnpInfo(rgSet)
+
+cleanX <- X[!(is.na(X$Probe_rs)),]
+
+beta <- getBeta(rgSet)
+names_SNP <- names_SNP[(c(snpI_names,snpII_names) %in% rownames(beta))]
+beta_SNP <- getBeta(rgSet)[names_SNP,]
+
+
+beta_SNP <- getBeta(rgSet)[c(snpI_names,snpII_names),]
+cor.snps <- cor(beta_SNP, use = "pairwise.complete.obs")
+
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+cor.snps.m <- melt(cor.snps)
+ggplot(cor.snps.m, aes(Var1, Var2, fill = value>0.8)) + geom_tile(color="darkgrey")+
+  scale_x_discrete(name="")+scale_y_discrete(name="")+
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+      scale_fill_manual(values = cbPalette[1:2])
+
+```
+
+
+
+
+
+
+
+
+
+ #####
+```{r}
+# Examine higher dimensions to look at other sources of variation
+par(mfrow=c(1,3))
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], dim=c(1,3))
+legend("top", legend=levels(factor(targets$Sample_Group)), text.col=pal, 
+       cex=0.7, bg="white")
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], dim=c(2,3))
+legend("topleft", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.7, bg="white")
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], dim=c(3,4))
+legend("topright", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.7, bg="white")
+```
+
+```{r}
+# ensure probes are in the same order in the mSetSq and detP objects
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),] 
+
+# remove any probes that have failed in one or more samples
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+table(keep)
+
+mSetSqFlt <- mSetSq[keep,]
+mSetSqFlt
+```
+
+
+```{r}
+
+# remove probes with SNPs at CpG site
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+mSetSqFlt
+
+```
+
+```{r}
+# exclude cross reactive probes 
+xReactiveProbes <- read.csv(file=paste(dataDirectory,
+                                       "48639-non-specific-probes-Illumina450k.csv",
+                                       sep="/"), stringsAsFactors=FALSE)
+keep <- !(featureNames(mSetSqFlt) %in% xReactiveProbes$TargetID)
+table(keep)
+
+
+mSetSqFlt <- mSetSqFlt[keep,] 
+mSetSqFlt
+
+
+```
+
+```{r}
+par(mfrow=c(1,2))
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], cex=0.8)
+legend("right", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.65, bg="white")
+
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Source)])
+legend("right", legend=levels(factor(targets$Sample_Source)), text.col=pal,
+       cex=0.7, bg="white")
+```
+
